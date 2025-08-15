@@ -1,0 +1,4 @@
+CI/CD releases: https://doc.rust-lang.org/cargo/guide/continuous-integration.html
+Compile time configurable MaskFlags
+docs/manpage
+configurable bounded queue size

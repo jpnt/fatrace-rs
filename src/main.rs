@@ -1,20 +1,24 @@
-use std::result::Result::{Ok, Err};
-use crossbeam::channel::{bounded, Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, bounded};
 use nix::{
-    fcntl::{open, OFlag},
+    fcntl::{OFlag, open},
     sys::{
-        fanotify::{
-            Fanotify, FanotifyEvent, EventFFlags, InitFlags,
-            MarkFlags, MaskFlags,
-        },
+        fanotify::{EventFFlags, Fanotify, FanotifyEvent, InitFlags, MarkFlags, MaskFlags},
         stat::Mode,
     },
 };
 use std::{
-    fs, os::unix::io::AsRawFd, path::{Path, PathBuf}, thread, time::Duration
+    error::Error,
+    result::Result::{Err, Ok},
+};
+use std::{
+    fs,
+    os::unix::io::AsRawFd,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
-// Acceptable file systems for monitoring
+// Acceptable file systems for monitoring TODO: make it configurable
 const ACCEPTED_FS: &[&str] = &["ext4", "xfs", "btrfs", "vfat"];
 
 /// Discover all monitored mount points from /proc/mounts
@@ -45,6 +49,7 @@ fn fd_to_path(fd: i32) -> std::io::Result<PathBuf> {
 /// Translate PID to process name
 fn pid_to_name(pid: i32) -> String {
     if pid <= 0 {
+        // TODO: pid under 0 represents a error or bug
         return "unknown".into();
     }
     fs::read_to_string(format!("/proc/{}/comm", pid))
@@ -57,26 +62,44 @@ fn mask_to_code(mask: MaskFlags) -> String {
     use MaskFlags as MF;
     let mut s = String::new();
 
-    if mask.contains(MF::FAN_OPEN)         { s.push('O'); }
-    if mask.contains(MF::FAN_ACCESS)       { s.push('R'); }
-    if mask.contains(MF::FAN_MODIFY)       { s.push('W'); }
-    if mask.contains(MF::FAN_CLOSE_WRITE)  { s.push('C'); }
-    if mask.contains(MF::FAN_CLOSE_NOWRITE){ s.push('c'); }
-    if mask.contains(MF::FAN_CREATE)       { s.push('+'); }
-    if mask.contains(MF::FAN_DELETE)       { s.push('D'); }
-    if mask.contains(MF::FAN_MOVED_FROM)   { s.push('<'); }
-    if mask.contains(MF::FAN_MOVED_TO)     { s.push('>'); }
+    // TODO: put all mask flags
+    if mask.contains(MF::FAN_OPEN) {
+        s.push('O');
+    }
+    if mask.contains(MF::FAN_ACCESS) {
+        s.push('R');
+    }
+    if mask.contains(MF::FAN_MODIFY) {
+        s.push('W');
+    }
+    if mask.contains(MF::FAN_CLOSE_WRITE) {
+        s.push('C');
+    }
+    if mask.contains(MF::FAN_CLOSE_NOWRITE) {
+        s.push('c');
+    }
+    if mask.contains(MF::FAN_CREATE) {
+        s.push('+');
+    }
+    if mask.contains(MF::FAN_DELETE) {
+        s.push('D');
+    }
+    if mask.contains(MF::FAN_MOVED_FROM) {
+        s.push('<');
+    }
+    if mask.contains(MF::FAN_MOVED_TO) {
+        s.push('>');
+    }
 
-    if s.is_empty() { s.push('?'); }
+    if s.is_empty() {
+        s.push('?');
+    }
     s
 }
 
 /// Setup fanotify instance
 fn setup_fanotify() -> nix::Result<Fanotify> {
-    Fanotify::init(
-        InitFlags::FAN_CLASS_NOTIF,
-        EventFFlags::O_RDONLY,
-    )
+    Fanotify::init(InitFlags::FAN_CLASS_NOTIF, EventFFlags::O_RDONLY)
 }
 
 /// Add a fanotify mark to a given mount path
@@ -89,7 +112,6 @@ fn mark_mount<P: AsRef<Path>>(fan: &Fanotify, mount_path: P) -> nix::Result<()> 
         Mode::empty(),
     )?;
 
-    // TODO: configurable
     // let events = MaskFlags::FAN_OPEN
     // | MaskFlags::FAN_ACCESS
     // | MaskFlags::FAN_MODIFY
@@ -111,19 +133,21 @@ fn mark_mount<P: AsRef<Path>>(fan: &Fanotify, mount_path: P) -> nix::Result<()> 
 
 /// Thread: continuously read events from fanotify and send via channel
 fn spawn_reader(fan: Fanotify, tx: Sender<FanotifyEvent>) {
-    thread::spawn(move || loop {
-        match fan.read_events() {
-            Ok(events) => {
-                for ev in events {
-                    // send only if consumer is alive
-                    if tx.send(ev).is_err() {
-                        break;
+    thread::spawn(move || {
+        loop {
+            match fan.read_events() {
+                Ok(events) => {
+                    for ev in events {
+                        // send only if consumer is alive
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("fanotify read error: {e}");
-                thread::sleep(Duration::from_millis(250));
+                Err(e) => {
+                    eprintln!("fanotify read error: {e}");
+                    thread::sleep(Duration::from_millis(250));
+                }
             }
         }
     });
@@ -148,7 +172,7 @@ fn process_events(rx: Receiver<FanotifyEvent>) {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let fan = setup_fanotify()?;
     let mounts = monitored_mounts();
 
@@ -162,15 +186,10 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Failed to mark {}: {}", mount, e);
         }
     }
-    
+
     let (tx, rx) = bounded::<FanotifyEvent>(512);
     spawn_reader(fan, tx);
     process_events(rx);
 
     Ok(())
-    // TODO: save events
-    // TODO: notify user (notify-send)
-    // TODO: use fatrace CLI or similar
-    // TODO: docs/manpage
 }
-
